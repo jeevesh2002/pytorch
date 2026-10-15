@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import atexit
 import collections
 import contextlib
 import copy
+import gc
 import hashlib
 import json
 import logging
 import os
 import pickle
+import shutil
+import tempfile
 import threading
 import types
+from pathlib import Path
 from typing import cast, TYPE_CHECKING
 
 from torch.compiler._cache import (
@@ -28,6 +33,9 @@ log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from types import ModuleType
+
+    from triton.runtime.autotuner import Autotuner
 
     from torch._inductor.runtime.triton_heuristics import (
         CachingAutotuner,
@@ -45,6 +53,124 @@ _frozen_triton_kernels_lock = threading.Lock()
 # producer's absolute include and library paths.
 _frozen_cpp_kernels: dict[str, bytes] = {}
 _frozen_cpp_kernels_lock = threading.Lock()
+
+
+def _triton_runtime_cache() -> ModuleType | None:
+    """Return the Triton runtime-cache transport, or None without a usable Triton.
+
+    Without it, a capture still freezes Inductor's static Triton launchers and
+    C++ kernels, but kernels launched directly through Triton's JIT are not captured
+    and compile again on first use in the serving process.
+    """
+    try:
+        from triton import knobs
+    except ImportError:
+        return None
+    if not hasattr(knobs, "autotuning") or not hasattr(knobs.cache, "manager_class"):
+        return None
+    from torch.compiler import _triton_runtime_cache
+
+    return _triton_runtime_cache
+
+
+def _private_directory(prefix: str) -> str:
+    # Kept until the process exits: kernels compiled while Triton used it keep
+    # loading their binaries from it.
+    directory = tempfile.mkdtemp(prefix=prefix)
+    atexit.register(lambda: shutil.rmtree(directory, ignore_errors=True))
+    return directory
+
+
+def _live_autotuners() -> list[Autotuner]:
+    from triton.runtime.autotuner import Autotuner
+
+    # type() rather than isinstance(): some module objects warn on __class__.
+    return [obj for obj in gc.get_objects() if issubclass(type(obj), Autotuner)]
+
+
+def _importable(root: Path) -> bool:
+    from torch.compiler._triton_runtime_cache import _READY
+
+    if not root.is_dir():
+        return not root.exists()
+    return not any(root.iterdir()) or (root / _READY).is_file()
+
+
+def _serving_triton_root(cache: ModuleType) -> str:
+    """Point Triton at a cache directory to import a runtime cache into, and turn
+    its autotuning cache on, for the rest of the process.
+
+    That is TRITON_CACHE_DIR if it is empty or holds an earlier import, and a
+    fresh directory otherwise, since the import refuses to mix with unrelated
+    entries (Inductor points TRITON_CACHE_DIR at its shared cache once it
+    compiles). Autotuners fix cache_results when they are decorated, so
+    existing ones are switched too, or they would benchmark again instead of
+    reading the imported decisions.
+    """
+    from triton import knobs
+
+    configured = os.environ.get("TRITON_CACHE_DIR")
+    if configured is None or not _importable(Path(configured)):
+        os.environ["TRITON_CACHE_DIR"] = _private_directory(
+            "torch_precompile_triton_load_"
+        )
+    # Through the environment rather than a knobs.cache.dir override, which would
+    # outlive any later TRITON_CACHE_DIR.
+    del knobs.cache.dir
+    knobs.autotuning.cache = True
+    for tuner in _live_autotuners():
+        tuner.cache_results = not knobs.runtime.interpret
+    return str(cache.runtime_cache_root())
+
+
+def _runtime_context() -> dict[str, str | None]:
+    import torch
+    from torch._inductor.codecache import torch_key
+
+    return {"torch_key": torch_key().hex(), "torch_cuda": torch.version.cuda}
+
+
+# (artifact key, runtime-cache root) pairs already imported by this process, so
+# a second precompile.load does not extract the same cache again.
+_imported_triton_runtime: set[tuple[str, str]] = set()
+_imported_triton_runtime_lock = threading.Lock()
+
+
+@CacheArtifactFactory.register
+class TritonRuntimeCacheArtifact(CacheArtifact):
+    @staticmethod
+    def type() -> str:
+        return "triton_runtime"
+
+    @staticmethod
+    def populate_first() -> bool:
+        # Graph artifacts can launch Triton kernels as they load.
+        return True
+
+    def populate_cache(self) -> None:
+        self.import_into_triton()
+
+    def import_into_triton(self) -> None:
+        cache = _triton_runtime_cache()
+        message = "The precompile cache contains a Triton runtime cache, but"
+        if cache is None:
+            raise RuntimeError(
+                f"{message} Triton is not installed or too old to import one"
+            )
+        try:
+            root = _serving_triton_root(cache)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{message} Triton has no cache directory to import it into ({exc})"
+            ) from exc
+        imported = (self.key, root)
+        with _imported_triton_runtime_lock:
+            if imported in _imported_triton_runtime:
+                return
+            if hashlib.sha256(self.content).hexdigest() != self.key:
+                raise RuntimeError("Corrupt Triton runtime-cache artifact")
+            cache.import_runtime_cache(self.content, context=_runtime_context())
+            _imported_triton_runtime.add(imported)
 
 
 @CacheArtifactFactory.register
@@ -323,6 +449,10 @@ class _RuntimeCapture:
         # captures are unsupported; counting them only keeps a misuse from
         # closing the scope under the other capture.
         self.captures = 0
+        # Restores Triton's cache settings when the scope closes.
+        self.triton_settings = contextlib.ExitStack()
+        # The fresh Triton cache directory whose JIT cache the scope ships.
+        self.cache_root = _own_triton_cache(self.triton_settings)
         self.freeze_lock = threading.Lock()
         self.triton_kernels: dict[str, list[CachingAutotuner]] = {}
         self.cpp_kernels: dict[str, tuple[str, Callable[[], object]]] = {}
@@ -336,6 +466,48 @@ def _active_capture() -> _RuntimeCapture | None:
     # A forked child inherits the parent's scope object; it is not the child's.
     owner = _capture
     return owner if owner is not None and owner.pid == os.getpid() else None
+
+
+def _own_triton_cache(settings: contextlib.ExitStack) -> str | None:
+    """Point Triton at a fresh cache directory and turn its autotuning cache on
+    until ``settings`` closes, so the directory holds exactly the Triton JIT
+    kernels and autotuning decisions the scope used.
+
+    Autotuners fix cache_results when they are decorated, so existing ones are
+    switched on for the scope too.
+    """
+    if _triton_runtime_cache() is None:
+        return None
+    from triton import knobs
+    from triton.runtime import driver
+
+    root = _private_directory("torch_precompile_triton_")
+    # Triton builds its driver's utility module (cuda_utils, hip_utils) into
+    # the cache directory and loads it once per process, so a process that
+    # already loaded it never builds it into the new directory. Copy the loaded
+    # build so the export carries it. _active, not active: that creates a driver.
+    utils = getattr(driver._active or driver._default, "utils", None)
+    loaded = getattr(getattr(utils, "load_binary", None), "__self__", None)
+    if (module := getattr(loaded, "__file__", None)) is not None:
+        module = Path(module)
+        entry = Path(root) / module.parent.name
+        entry.mkdir(exist_ok=True)
+        shutil.copy2(module, entry / module.name)
+    settings.enter_context(knobs.cache.scope())
+    settings.enter_context(knobs.autotuning.scope())
+    knobs.cache.dir = root
+    knobs.autotuning.cache = True
+    tuners = _live_autotuners()
+    restore = [(tuner, tuner.cache_results) for tuner in tuners]
+    for tuner in tuners:
+        tuner.cache_results = not knobs.runtime.interpret
+
+    def restore_cache_results() -> None:
+        for tuner, cache_results in restore:
+            tuner.cache_results = cache_results
+
+    settings.callback(restore_cache_results)
+    return root
 
 
 @contextlib.contextmanager
@@ -360,6 +532,8 @@ def capture_scope() -> Iterator[None]:
                 owner.triton_kernels.clear()
                 owner.cpp_kernels.clear()
                 _capture = None
+        if last:
+            owner.triton_settings.close()
 
 
 def _freeze_triton_kernels(kernels: dict[str, list[CachingAutotuner]]) -> bytes:
@@ -388,11 +562,18 @@ def _freeze_triton_kernels(kernels: dict[str, list[CachingAutotuner]]) -> bytes:
     return pickle.dumps(static_kernels)
 
 
+def _current_root(cache: ModuleType) -> str | None:
+    try:
+        return str(cache.runtime_cache_root())
+    except Exception:
+        return None
+
+
 def freeze_runtime_cache(
     snapshot: Callable[[], bytes | None], write: Callable[[bytes | None], None]
 ) -> None:
-    """Freeze the scope's static Triton kernels and C++ kernel binaries into the
-    cache artifact and pass it to ``write``.
+    """Freeze the scope's static Triton kernels, C++ kernel binaries and Triton
+    JIT cache into the cache artifact and pass it to ``write``.
 
     Pending async compiles are waited on and every recorded C++ kernel is built
     before ``snapshot`` renders the artifact, so what they record is in it. A
@@ -407,7 +588,10 @@ def freeze_runtime_cache(
     owner = _active_capture()
     if owner is None:
         raise RuntimeError("precompile.capture has no runtime capture scope")
+    cache = _triton_runtime_cache() if owner.cache_root is not None else None
     with owner.freeze_lock:
+        if cache is not None and _current_root(cache) != owner.cache_root:
+            raise RuntimeError("Triton's cache directory changed during the capture")
         # Keep the workers: a save() checkpoint is followed by more of the block.
         AsyncCompile.drain_pending(shutdown=False)
         with _capture_lock:
@@ -427,6 +611,7 @@ def freeze_runtime_cache(
         if any(
             kind in artifacts
             for kind in (
+                TritonRuntimeCacheArtifact.type(),
                 InductorTritonCacheArtifact.type(),
                 InductorCppCacheArtifact.type(),
             )
@@ -439,6 +624,11 @@ def freeze_runtime_cache(
             cpp_kernels = {key: path for key, (path, _) in owner.cpp_kernels.items()}
         static_payload = _freeze_triton_kernels(kernels)
         cpp_payload = _freeze_cpp_kernels(cpp_kernels)
+        if cache is not None:
+            payload = cache.export_runtime_cache(context=_runtime_context())
+            artifacts[TritonRuntimeCacheArtifact.type()] = [
+                TritonRuntimeCacheArtifact(hashlib.sha256(payload).hexdigest(), payload)
+            ]
         artifacts[InductorTritonCacheArtifact.type()] = [
             InductorTritonCacheArtifact(
                 hashlib.sha256(static_payload).hexdigest(), static_payload
